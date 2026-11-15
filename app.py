@@ -921,10 +921,15 @@ with tab_ml:
 
         s_stats = perf_stats(strat, rf_rate)
         b_stats = perf_stats(bh, rf_rate)
-        cmp_df = pd.DataFrame({"ML Strategy": s_stats, "Buy & Hold": b_stats})
-        for idx in ["Total Return", "CAGR", "Volatility", "Max Drawdown", "Win Rate"]:
-            cmp_df.loc[idx] = cmp_df.loc[idx].apply(lambda v: f"{v*100:.2f}%")
-        cmp_df.loc["Sharpe"] = cmp_df.loc["Sharpe"].apply(lambda v: f"{v:.2f}")
+        def _fmt(stats):
+            out = {}
+            for key, val in stats.items():
+                out[key] = f"{val:.2f}" if key == "Sharpe" else f"{val*100:.2f}%"
+            return out
+
+        cmp_df = pd.DataFrame(
+            {"ML Strategy": _fmt(s_stats), "Buy & Hold": _fmt(b_stats)}
+        ).astype(str)
         st.dataframe(cmp_df, **WIDE)
         st.caption(f"Number of trades: {n_trades}. Past performance does not "
                    "guarantee future results.")
