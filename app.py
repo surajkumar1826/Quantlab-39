@@ -20,57 +20,65 @@ st.set_page_config(
 st.markdown("""
 <style>
 .stApp {
-    background: linear-gradient(135deg, #080D18, #101B2D);
-    color: #F1F5F9;
+    background: #F3F6FA;
+    color: #172B4D;
+}
+
+[data-testid="stHeader"] {
+    background: #F3F6FA;
 }
 
 [data-testid="stSidebar"] {
-    background: #111C2E;
-    border-right: 1px solid #263750;
+    background: #E8EEF5;
 }
 
 h1, h2, h3 {
-    color: #00D4AA !important;
-    font-weight: 700;
+    color: #172B4D !important;
+    font-weight: 750;
 }
 
-.stButton > button {
-    background: linear-gradient(90deg, #3978F6, #00BFA6);
-    color: white;
-    border: none;
-    border-radius: 10px;
-    padding: 10px 22px;
-    font-weight: 700;
-}
-
-.stButton > button:hover {
-    background: #00D4AA;
-    color: #080D18;
-    border: none;
+p, label, .stMarkdown {
+    color: #34445B;
 }
 
 [data-testid="stMetric"] {
-    background: #15243A;
-    border: 1px solid #263B56;
-    padding: 18px;
+    background: #FFFFFF;
+    border: 1px solid #DCE4ED;
+    padding: 20px;
     border-radius: 14px;
+    box-shadow: 0 3px 12px rgba(23,43,77,0.05);
 }
 
 [data-testid="stMetricValue"] {
-    color: #00D4AA;
+    color: #079C85;
+}
+
+.stButton > button {
+    background: #079C85;
+    color: white;
+    border: none;
+    border-radius: 9px;
+    font-weight: 700;
+    padding: 10px 20px;
+}
+
+.stButton > button:hover {
+    background: #067C6B;
+    color: white;
 }
 
 [data-testid="stDataFrame"] {
-    border: 1px solid #263B56;
+    background: white;
     border-radius: 12px;
+    border: 1px solid #DCE4ED;
 }
 
 .stTabs [aria-selected="true"] {
-    color: #00D4AA !important;
+    color: #079C85 !important;
 }
 
 hr {
-    border-color: #263750;
+    border-color: #DCE4ED;
 }
 </style>
 """, unsafe_allow_html=True)
