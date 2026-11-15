@@ -20,16 +20,57 @@ st.set_page_config(
 st.markdown("""
 <style>
 .stApp {
-    background-color: #080d18;
-    color: white;
+    background: linear-gradient(135deg, #080D18, #101B2D);
+    color: #F1F5F9;
 }
+
+[data-testid="stSidebar"] {
+    background: #111C2E;
+    border-right: 1px solid #263750;
+}
+
+h1, h2, h3 {
+    color: #00D4AA !important;
+    font-weight: 700;
+}
+
+.stButton > button {
+    background: linear-gradient(90deg, #3978F6, #00BFA6);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 22px;
+    font-weight: 700;
+}
+
+.stButton > button:hover {
+    background: #00D4AA;
+    color: #080D18;
+    border: none;
+}
+
 [data-testid="stMetric"] {
-    background: #151e30;
-    padding: 15px;
+    background: #15243A;
+    border: 1px solid #263B56;
+    padding: 18px;
+    border-radius: 14px;
+}
+
+[data-testid="stMetricValue"] {
+    color: #00D4AA;
+}
+
+[data-testid="stDataFrame"] {
+    border: 1px solid #263B56;
     border-radius: 12px;
 }
-h1, h2, h3 {
-    color: #55d6be;
+
+.stTabs [aria-selected="true"] {
+    color: #00D4AA !important;
+}
+
+hr {
+    border-color: #263750;
 }
 </style>
 """, unsafe_allow_html=True)
