@@ -34,6 +34,11 @@ except Exception:
 
 WIDE = {"width": "stretch"} if _ver >= (1, 50) else {"use_container_width": True}
 
+
+def plot_chart(fig, key=None, **kw):
+    # theme=None keeps our own dark Plotly styling (Streamlit theme was hiding titles)
+    st.plotly_chart(fig, key=key, theme=None, **WIDE)
+
 # =====================================================
 # THEME
 # =====================================================
@@ -44,47 +49,78 @@ st.markdown("""
 [data-testid="stHeader"] { background: #0B1220; }
 [data-testid="stSidebar"] { background: #172438; }
 [data-testid="stSidebar"] * { color: #E2E8F0; }
-h1, h2, h3 { color: #F8FAFC !important; font-weight: 750; }
-p, label { color: #CBD5E1; }
+h1, h2, h3, h4 { color: #F8FAFC !important; font-weight: 750; }
+p, label, li, span { color: #CBD5E1; }
+[data-testid="stCaptionContainer"] * { color: #94A3B8 !important; }
 
+/* Metric cards: dark card, bright readable text */
 [data-testid="stMetric"] {
-    background: #F1F5F9;
-    border: 1px solid #DCE4ED;
-    padding: 17px;
+    background: #172438;
+    border: 1px solid #2B3C54;
+    padding: 16px;
     border-radius: 13px;
 }
-[data-testid="stMetricLabel"] { color: #475569 !important; }
-[data-testid="stMetricValue"] { color: #0F766E !important; }
-[data-testid="stMetricDelta"] { color: #059669 !important; }
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {
+    color: #94A3B8 !important;
+}
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * {
+    color: #00E5BE !important;
+    font-weight: 700;
+}
 
-.stButton > button {
+/* Buttons */
+.stButton > button, .stDownloadButton > button {
     background: #00BFA6;
-    color: #07111F;
+    color: #07111F !important;
     border: none;
     border-radius: 9px;
     font-weight: 750;
     padding: 10px 18px;
 }
-.stButton > button:hover { background: #00D6B5; color: #07111F; }
+.stButton > button:hover, .stDownloadButton > button:hover {
+    background: #00D6B5; color: #07111F !important;
+}
+.stButton > button p, .stDownloadButton > button p { color: #07111F !important; }
 
-[data-testid="stDataFrame"] { background: #F1F5F9; border-radius: 12px; }
-.stTabs [aria-selected="true"] { color: #00D6A3 !important; }
+/* Inputs: dark boxes with light text */
+[data-baseweb="select"] > div,
+[data-baseweb="input"],
+[data-baseweb="base-input"],
+[data-testid="stNumberInput"] input {
+    background-color: #0F1B2D !important;
+    color: #F1F5F9 !important;
+    border-color: #2B3C54 !important;
+}
+[data-baseweb="select"] *, [data-baseweb="input"] input,
+[data-testid="stNumberInput"] input {
+    color: #F1F5F9 !important;
+}
+[data-baseweb="select"] svg { fill: #CBD5E1 !important; }
+
+/* Dropdown menus */
+[data-baseweb="popover"] ul, [data-baseweb="menu"] {
+    background: #0F1B2D !important;
+}
+[data-baseweb="popover"] li, [data-baseweb="popover"] li * {
+    color: #F1F5F9 !important;
+}
+[data-baseweb="popover"] li:hover { background: #1E3350 !important; }
+
+/* Multiselect chips */
+[data-baseweb="tag"] { background: #00BFA6 !important; }
+[data-baseweb="tag"] * { color: #07111F !important; }
+
+/* Tabs */
 .stTabs [data-baseweb="tab"] { color: #CBD5E1; }
+.stTabs [aria-selected="true"] { color: #00D6A3 !important; }
 
+/* Expander, alerts, divider */
 [data-testid="stExpander"] {
     background: #172438;
     border: 1px solid #2B3C54;
     border-radius: 10px;
 }
 hr { border-color: #29384D; }
-
-[data-testid="stSelectbox"] > div > div,
-[data-testid="stMultiSelect"] > div > div,
-[data-testid="stNumberInput"] > div > div {
-    background: #F1F5F9;
-    color: #172B4D;
-    border-radius: 8px;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -515,7 +551,7 @@ def backtest(actual, pred, threshold, allow_short, cost_bps):
 
 def style_fig(fig, height=450, title=None):
     fig.update_layout(
-        title=title,
+        title=dict(text=title, font=dict(color="#F1F5F9", size=16)) if title else None,
         template="plotly_dark",
         paper_bgcolor="#0B1220",
         plot_bgcolor="#111C2E",
@@ -523,6 +559,10 @@ def style_fig(fig, height=450, title=None):
         height=height,
         margin=dict(l=20, r=20, t=60, b=20)
     )
+    fig.update_xaxes(gridcolor="#22324A", zerolinecolor="#2B3C54",
+                     tickfont=dict(color="#CBD5E1"))
+    fig.update_yaxes(gridcolor="#22324A", zerolinecolor="#2B3C54",
+                     tickfont=dict(color="#CBD5E1"))
     return fig
 
 
@@ -570,14 +610,18 @@ def show_chart(data, name):
     ), row=3, col=1)
 
     fig.update_layout(
-        title=f"{name} | Technical Analysis",
+        title=dict(text=f"{name} | Technical Analysis",
+                   font=dict(color="#F1F5F9", size=16)),
         template="plotly_dark", paper_bgcolor="#0B1220",
         plot_bgcolor="#111C2E", font=dict(color="#E2E8F0"),
         height=820, xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="right", x=1)
     )
-    st.plotly_chart(fig, key="tech_chart", **WIDE)
+    fig.update_xaxes(gridcolor="#22324A")
+    fig.update_yaxes(gridcolor="#22324A")
+    fig.update_annotations(font=dict(color="#CBD5E1"))
+    plot_chart(fig, key="tech_chart", **WIDE)
 
 
 # =====================================================
@@ -701,7 +745,7 @@ with tab_pred:
             color_continuous_scale=["#FF5263", "#64748B", "#00D6A3"],
             color_continuous_midpoint=0
         )
-        st.plotly_chart(
+        plot_chart(
             style_fig(fig, 380, "Expected Next-Day Return (%)"),
             key="pred_bar", **WIDE
         )
@@ -757,7 +801,7 @@ with tab_tech:
                     ],
                 }
             ))
-            st.plotly_chart(style_fig(gauge, 300), key="tech_gauge", **WIDE)
+            plot_chart(style_fig(gauge, 300), key="tech_gauge", **WIDE)
 
         with g2:
             st.markdown("**Why this score?**")
@@ -854,7 +898,7 @@ with tab_ml:
         fig.add_bar(x=table["Model"], y=table["Baseline (%)"],
                     name="Always-majority baseline", marker_color="#64748B")
         fig.update_layout(barmode="group", yaxis_range=[40, 65])
-        st.plotly_chart(
+        plot_chart(
             style_fig(fig, 340, "Directional Accuracy vs Baseline"),
             key="ml_dir_bar", **WIDE
         )
@@ -881,7 +925,7 @@ with tab_ml:
             if len(imp):
                 fig = px.bar(x=imp.values, y=imp.index, orientation="h")
                 fig.update_traces(marker_color="#00D6A3")
-                st.plotly_chart(
+                plot_chart(
                     style_fig(fig, 380, "Top 10 Feature Importance"),
                     key="ml_imp", **WIDE
                 )
@@ -894,7 +938,7 @@ with tab_ml:
             fig.add_scatter(x=r["pred"].index[-tail:],
                             y=r["pred"].iloc[-tail:] * 100,
                             name="Predicted", line=dict(color="#F5B942", width=2))
-            st.plotly_chart(
+            plot_chart(
                 style_fig(fig, 380, "Actual vs Predicted Return (%), last 120 test days"),
                 key="ml_avp", **WIDE
             )
@@ -914,7 +958,7 @@ with tab_ml:
             "Buy & Hold": (1 + bh).cumprod()
         })
         fig = px.line(eq, color_discrete_sequence=["#00D6A3", "#64748B"])
-        st.plotly_chart(
+        plot_chart(
             style_fig(fig, 400, "Equity Curve (start = 1.0)"),
             key="bt_eq", **WIDE
         )
@@ -979,7 +1023,7 @@ with tab_risk:
                 x=dd.index, y=dd * 100, fill="tozeroy",
                 line=dict(color="#FF5263")
             ))
-            st.plotly_chart(
+            plot_chart(
                 style_fig(fig, 340, "Drawdown (%)"), key="risk_dd", **WIDE
             )
         with r2:
@@ -988,7 +1032,7 @@ with tab_risk:
             ))
             fig.add_vline(x=var95 * 100, line_dash="dash",
                           line_color="#FF5263", annotation_text="VaR 95%")
-            st.plotly_chart(
+            plot_chart(
                 style_fig(fig, 340, "Daily Return Distribution (%)"),
                 key="risk_hist", **WIDE
             )
@@ -1032,7 +1076,7 @@ with tab_risk:
                         name="25-75% range")
         fig.add_scatter(x=xs, y=p50, name="Median",
                         line=dict(color="#F5B942", width=2.5))
-        st.plotly_chart(
+        plot_chart(
             style_fig(fig, 430, f"{horizon}-day simulated price paths"),
             key="mc_fan", **WIDE
         )
@@ -1162,7 +1206,7 @@ with tab_port:
             valid = pdf.dropna(subset=["Value"])
             if not valid.empty:
                 fig = px.pie(valid, names="Instrument", values="Value", hole=0.45)
-                st.plotly_chart(style_fig(fig, 360, "Allocation by Value"),
+                plot_chart(style_fig(fig, 360, "Allocation by Value"),
                                 key="trk_pie", **WIDE)
 
             st.download_button("📥 Download positions", pdf.to_csv(index=False),
@@ -1231,7 +1275,7 @@ with tab_port:
                     fig.update_layout(
                         xaxis_title="Volatility (%)", yaxis_title="Return (%)"
                     )
-                    st.plotly_chart(
+                    plot_chart(
                         style_fig(fig, 460, "Efficient Frontier (random sampling)"),
                         key="opt_frontier", **WIDE
                     )
@@ -1277,7 +1321,7 @@ with tab_port:
                 corr = prices.pct_change().dropna().tail(252).corr()
                 fig = px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1,
                                 color_continuous_scale="RdYlGn")
-                st.plotly_chart(
+                plot_chart(
                     style_fig(fig, 520, "Return Correlation (last ~1 year)"),
                     key="corr_heat", **WIDE
                 )
@@ -1364,7 +1408,7 @@ with tab_explore:
             if not reb.empty:
                 reb = reb / reb.iloc[0] * 100
                 fig = px.line(reb)
-                st.plotly_chart(
+                plot_chart(
                     style_fig(fig, 420, "Performance Comparison (rebased to 100, 1 year)"),
                     key="explorer_reb", **WIDE
                 )
