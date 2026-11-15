@@ -7,11 +7,12 @@ import zipfile
 import json
 from pathlib import Path
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ---------------- CONFIGURATION ----------------
+# ---------------- CONFIG ----------------
 
 st.set_page_config(
-    page_title="QuantLab 39 | AI Stock Prediction",
+    page_title="QUANTLAB 39 | AI Stock Intelligence",
     page_icon="📈",
     layout="wide"
 )
@@ -20,11 +21,11 @@ st.markdown("""
 <style>
 .stApp {
     background-color: #080d18;
-    color: #ffffff;
+    color: white;
 }
 [data-testid="stMetric"] {
     background: #151e30;
-    padding: 18px;
+    padding: 15px;
     border-radius: 12px;
 }
 h1, h2, h3 {
@@ -35,6 +36,8 @@ h1, h2, h3 {
 
 BASE = Path(__file__).parent
 ZIP_PATH = BASE / "QuantLab39_models.zip"
+
+STOCKS = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"]
 
 # ---------------- LOAD MODELS ----------------
 
@@ -50,17 +53,74 @@ def load_models():
         return None, None
 
     config_path = configs[0]
-    model_root = config_path.parent
 
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    return config, model_root
+    return config, config_path.parent
 
 
 config, model_root = load_models()
 
-# ---------------- FEATURE ENGINEERING ----------------
+# ---------------- MARKET DATA ----------------
+
+@st.cache_data(ttl=300)
+def get_stock_data(ticker):
+    df = yf.download(
+        ticker,
+        period="5y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False
+    )
+
+    if df.empty:
+        raise ValueError("No stock data available.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+# ---------------- INDICATORS ----------------
+
+def add_indicators(df):
+    df = df.copy()
+
+    df["SMA20"] = df["Close"].rolling(20).mean()
+    df["SMA50"] = df["Close"].rolling(50).mean()
+    df["SMA200"] = df["Close"].rolling(200).mean()
+
+    delta = df["Close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+
+    df["MACD"] = ema12 - ema26
+    df["Signal"] = df["MACD"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["MACD_Hist"] = df["MACD"] - df["Signal"]
+
+    return df
+
+# ---------------- MODEL FEATURES ----------------
 
 def create_features(df):
     df = df.copy()
@@ -79,7 +139,8 @@ def create_features(df):
         )
 
     df["distEma12"] = (
-        df["Close"] / df["Close"].ewm(span=12).mean() - 1
+        df["Close"] /
+        df["Close"].ewm(span=12).mean() - 1
     )
 
     df["logVolume"] = np.log1p(df["Volume"])
@@ -90,12 +151,13 @@ def create_features(df):
 
     df["volatility5"] = df["dailyReturn"].rolling(5).std()
 
-    return df.replace([np.inf, -np.inf], np.nan).dropna()
-
+    return df.replace(
+        [np.inf, -np.inf], np.nan
+    ).dropna()
 
 # ---------------- PREDICTION ----------------
 
-def predict_stock(ticker):
+def predict_stock(ticker, data):
     folder = model_root / ticker
 
     model_path = folder / "ridge_model.pkl"
@@ -103,29 +165,11 @@ def predict_stock(ticker):
 
     if not model_path.exists() or not scaler_path.exists():
         raise FileNotFoundError(
-            f"Saved Ridge model not found for {ticker}"
+            f"Model not found for {ticker}"
         )
 
     model = joblib.load(model_path)
     scaler = joblib.load(scaler_path)
-
-    data = yf.download(
-        ticker,
-        period="5y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False
-    )
-
-    if data.empty:
-        raise ValueError("Unable to download stock data.")
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data = data[["Open", "High", "Low", "Close", "Volume"]]
-
-    features_df = create_features(data)
 
     features = [
         "intradaySpread",
@@ -141,27 +185,120 @@ def predict_stock(ticker):
         "volatility5"
     ]
 
-    X = features_df[features].iloc[[-1]]
+    feature_data = create_features(data)
+
+    X = feature_data[features].iloc[[-1]]
     X_scaled = scaler.transform(X)
 
     predicted_return = float(model.predict(X_scaled)[0])
 
-    current_price = float(data["Close"].iloc[-1])
-    predicted_price = current_price * (1 + predicted_return)
+    current = float(data["Close"].iloc[-1])
+    predicted = current * (1 + predicted_return)
 
-    return data, current_price, predicted_price, predicted_return
+    return current, predicted, predicted_return
 
+# ---------------- CHARTS ----------------
 
-# ---------------- DASHBOARD ----------------
+def show_chart(data, ticker):
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.60, 0.20, 0.20],
+        subplot_titles=(
+            "Price & Moving Averages",
+            "RSI (14)",
+            "MACD"
+        )
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=data.index,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            name="Price"
+        ),
+        row=1, col=1
+    )
+
+    for col, color in [
+        ("SMA20", "#55d6be"),
+        ("SMA50", "#ffbd59"),
+        ("SMA200", "#e879f9")
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=data.index,
+                y=data[col],
+                name=col,
+                line=dict(color=color, width=1.5)
+            ),
+            row=1, col=1
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["RSI"],
+            name="RSI",
+            line=dict(color="#55d6be")
+        ),
+        row=2, col=1
+    )
+
+    fig.add_hline(
+        y=70, line_dash="dash",
+        line_color="red", row=2, col=1
+    )
+
+    fig.add_hline(
+        y=30, line_dash="dash",
+        line_color="green", row=2, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["MACD"],
+            name="MACD"
+        ),
+        row=3, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["Signal"],
+            name="Signal"
+        ),
+        row=3, col=1
+    )
+
+    fig.update_layout(
+        title=f"{ticker} Technical Analysis",
+        template="plotly_dark",
+        height=800,
+        xaxis_rangeslider_visible=False
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------------- APP HEADER ----------------
 
 st.title("📈 QUANTLAB 39")
-st.caption("AI Powered Multi-Stock Prediction Platform")
+st.caption("AI Powered Stock Intelligence Platform")
 
 if config is None:
-    st.error("Model configuration not found. Check the ZIP file structure.")
+    st.error("Model configuration not found.")
     st.stop()
 
-stocks = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"]
+# ---------------- SIDEBAR ----------------
+
+st.sidebar.title("⚙️ Controls")
 
 mode = st.sidebar.radio(
     "Prediction Mode",
@@ -169,83 +306,85 @@ mode = st.sidebar.radio(
 )
 
 if mode == "Single Stock":
-    selected = st.sidebar.selectbox("Select Stock", stocks)
-    selected_stocks = [selected]
+    selected_stocks = [
+        st.sidebar.selectbox("Select Stock", STOCKS)
+    ]
 else:
     selected_stocks = st.sidebar.multiselect(
         "Select Stocks",
-        stocks,
+        STOCKS,
         default=["AAPL", "NVDA", "MSFT"]
     )
 
+period = st.sidebar.selectbox(
+    "Chart History",
+    ["1 Month", "3 Months", "6 Months", "1 Year", "5 Years"],
+    index=3
+)
+
+period_map = {
+    "1 Month": 22,
+    "3 Months": 66,
+    "6 Months": 132,
+    "1 Year": 252,
+    "5 Years": 1260
+}
+
 st.sidebar.markdown("---")
-st.sidebar.caption("Model: Ridge Regression")
+st.sidebar.caption("Prediction Model: Ridge Regression")
 st.sidebar.caption("Forecast: Next Trading Day")
 
-if st.button("🚀 Generate Prediction", type="primary"):
-    if not selected_stocks:
-        st.warning("Select at least one stock.")
-        st.stop()
+# ---------------- TABS ----------------
 
-    results = []
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Predictions",
+    "📈 Technical Analysis",
+    "💰 Portfolio Calculator",
+    "ℹ️ About"
+])
 
-    for ticker in selected_stocks:
-        try:
-            data, current, predicted, ret = predict_stock(ticker)
+# ---------------- PREDICTIONS ----------------
 
-            results.append({
-                "Ticker": ticker,
-                "Current Price": current,
-                "Predicted Price": predicted,
-                "Expected Return (%)": ret * 100
-            })
+with tab1:
+    st.subheader("AI Stock Predictions")
 
-            if mode == "Single Stock":
-                st.subheader(f"{ticker} Stock Analysis")
+    if st.button("🚀 Generate Prediction", type="primary"):
+        if not selected_stocks:
+            st.warning("Select at least one stock.")
+        else:
+            results = []
+            chart_data = {}
 
-                c1, c2, c3 = st.columns(3)
+            with st.spinner("Analyzing market data..."):
+                for ticker in selected_stocks:
+                    try:
+                        data = get_stock_data(ticker)
 
-                c1.metric("Current Price", f"${current:,.2f}")
-                c2.metric("Predicted Price", f"${predicted:,.2f}")
-                c3.metric(
-                    "Expected Return",
-                    f"{ret * 100:.2f}%",
-                    delta=f"{ret * 100:.2f}%"
-                )
+                        current, predicted, ret = predict_stock(
+                            ticker, data
+                        )
 
-                fig = go.Figure()
+                        results.append({
+                            "Ticker": ticker,
+                            "Current Price": current,
+                            "Predicted Price": predicted,
+                            "Expected Return (%)": ret * 100
+                        })
 
-                fig.add_trace(go.Scatter(
-                    x=data.index[-180:],
-                    y=data["Close"].iloc[-180:],
-                    name="Historical Price",
-                    line=dict(color="#55d6be", width=2)
-                ))
+                        chart_data[ticker] = data
 
-                fig.add_trace(go.Scatter(
-                    x=[data.index[-1], data.index[-1] + pd.Timedelta(days=1)],
-                    y=[current, predicted],
-                    name="Next Day Prediction",
-                    line=dict(color="#ffbd59", width=3, dash="dash")
-                ))
+                    except Exception as e:
+                        st.error(f"{ticker}: {e}")
 
-                fig.update_layout(
-                    title=f"{ticker} Price Analysis",
-                    template="plotly_dark",
-                    height=450,
-                    xaxis_title="Date",
-                    yaxis_title="Price (USD)"
-                )
+            st.session_state["results"] = results
+            st.session_state["chart_data"] = chart_data
 
-                st.plotly_chart(fig, use_container_width=True)
+    if st.session_state.get("results"):
+        result_df = pd.DataFrame(
+            st.session_state["results"]
+        )
 
-        except Exception as e:
-            st.error(f"{ticker}: {str(e)}")
-
-    if results:
         st.subheader("Prediction Summary")
-
-        result_df = pd.DataFrame(results)
 
         st.dataframe(
             result_df.style.format({
@@ -257,14 +396,185 @@ if st.button("🚀 Generate Prediction", type="primary"):
         )
 
         st.download_button(
-            "📥 Download Predictions CSV",
+            "📥 Download CSV",
             result_df.to_csv(index=False),
-            file_name="quantlab39_predictions.csv",
-            mime="text/csv"
+            "quantlab39_predictions.csv",
+            "text/csv"
         )
 
+        for _, row in result_df.iterrows():
+            ticker = row["Ticker"]
+
+            with st.expander(
+                f"{ticker} - Detailed Analysis",
+                expanded=(len(result_df) == 1)
+            ):
+                c1, c2, c3 = st.columns(3)
+
+                c1.metric(
+                    "Current Price",
+                    f"${row['Current Price']:,.2f}"
+                )
+
+                c2.metric(
+                    "Predicted Price",
+                    f"${row['Predicted Price']:,.2f}"
+                )
+
+                c3.metric(
+                    "Expected Return",
+                    f"{row['Expected Return (%)']:.2f}%"
+                )
+
+                chart_data = st.session_state["chart_data"][ticker]
+                show_chart(
+                    add_indicators(chart_data).tail(
+                        period_map[period]
+                    ),
+                    ticker
+                )
+
+# ---------------- TECHNICAL ANALYSIS ----------------
+
+with tab2:
+    st.subheader("Technical Analysis Center")
+
+    technical_stock = st.selectbox(
+        "Choose Stock",
+        STOCKS,
+        key="technical_stock"
+    )
+
+    if st.button("Analyze Stock"):
+        try:
+            data = add_indicators(
+                get_stock_data(technical_stock)
+            )
+
+            latest = data.iloc[-1]
+
+            a, b, c = st.columns(3)
+
+            a.metric(
+                "RSI",
+                f"{latest['RSI']:.2f}"
+            )
+
+            b.metric(
+                "MACD",
+                f"{latest['MACD']:.2f}"
+            )
+
+            c.metric(
+                "Latest Price",
+                f"${latest['Close']:.2f}"
+            )
+
+            if latest["RSI"] > 70:
+                st.warning("RSI indicates a potentially overbought condition.")
+            elif latest["RSI"] < 30:
+                st.success("RSI indicates a potentially oversold condition.")
+            else:
+                st.info("RSI is in the neutral range.")
+
+            show_chart(
+                data.tail(period_map[period]),
+                technical_stock
+            )
+
+        except Exception as e:
+            st.error(str(e))
+
+# ---------------- PORTFOLIO CALCULATOR ----------------
+
+with tab3:
+    st.subheader("💰 Portfolio Calculator")
+
+    st.caption(
+        "Calculate the current value and hypothetical profit/loss "
+        "of your stock holdings."
+    )
+
+    investment = st.number_input(
+        "Investment per share ($)",
+        min_value=0.01,
+        value=100.0
+    )
+
+    quantity = st.number_input(
+        "Number of shares",
+        min_value=1,
+        value=10
+    )
+
+    portfolio_stock = st.selectbox(
+        "Select Stock",
+        STOCKS,
+        key="portfolio_stock"
+    )
+
+    if st.button("Calculate Portfolio"):
+        try:
+            data = get_stock_data(portfolio_stock)
+
+            current = float(data["Close"].iloc[-1])
+
+            invested = investment * quantity
+            current_value = current * quantity
+            profit = current_value - invested
+            returns = (profit / invested) * 100
+
+            a, b, c = st.columns(3)
+
+            a.metric("Investment", f"${invested:,.2f}")
+            b.metric("Current Value", f"${current_value:,.2f}")
+            c.metric(
+                "Profit / Loss",
+                f"${profit:,.2f}",
+                delta=f"{returns:.2f}%"
+            )
+
+        except Exception as e:
+            st.error(str(e))
+
+# ---------------- ABOUT ----------------
+
+with tab4:
+    st.subheader("About QUANTLAB 39")
+
+    st.markdown("""
+    ### AI Powered Stock Intelligence
+
+    **Prediction Model**
+    - Ridge Regression
+
+    **Technical Indicators**
+    - RSI (14)
+    - MACD
+    - SMA 20
+    - SMA 50
+    - SMA 200
+
+    **Market Data**
+    - Yahoo Finance
+
+    **Technology Stack**
+    - Python
+    - Streamlit
+    - Pandas
+    - NumPy
+    - Scikit-learn
+    - Plotly
+
+    **Disclaimer**
+
+    This application is an educational project.
+    Predictions and indicators are not financial advice.
+    """)
+
 st.markdown("---")
+
 st.caption(
-    "QuantLab 39 | AI Stock Prediction Platform | "
-    "Educational purposes only. Predictions are not financial advice."
+    "QUANTLAB 39 | AI Stock Intelligence Platform | "
+    "Educational purposes only."
 )
