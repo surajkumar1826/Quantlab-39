@@ -10,11 +10,18 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
-from sklearn.linear_model import Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge, Lasso, LogisticRegression
+from sklearn.ensemble import (
+    RandomForestRegressor, GradientBoostingRegressor,
+    RandomForestClassifier, GradientBoostingClassifier
+)
+from sklearn.model_selection import TimeSeriesSplit
+from scipy.optimize import minimize  # installed together with scikit-learn
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
+)
 
 # =====================================================
 # CONFIGURATION
@@ -51,7 +58,8 @@ st.markdown("""
 [data-testid="stSidebar"] * { color: #E2E8F0; }
 h1, h2, h3, h4 { color: #F8FAFC !important; font-weight: 750; }
 p, label, li, span { color: #CBD5E1; }
-[data-testid="stCaptionContainer"] * { color: #94A3B8 !important; }
+[data-testid="stCaptionContainer"] * { color: #AEBBCD !important; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * { color: #C5D0E0 !important; }
 
 /* Metric cards: dark card, bright readable text */
 [data-testid="stMetric"] {
@@ -107,8 +115,10 @@ p, label, li, span { color: #CBD5E1; }
 [data-baseweb="popover"] li:hover { background: #1E3350 !important; }
 
 /* Multiselect chips */
-[data-baseweb="tag"] { background: #00BFA6 !important; }
-[data-baseweb="tag"] * { color: #07111F !important; }
+span[data-baseweb="tag"], div[data-baseweb="tag"] { background-color: #00BFA6 !important; }
+span[data-baseweb="tag"] *, div[data-baseweb="tag"] * {
+    color: #07111F !important; fill: #07111F !important; font-weight: 650;
+}
 
 /* Tabs */
 .stTabs [data-baseweb="tab"] { color: #CBD5E1; }
@@ -213,15 +223,25 @@ def load_stock_model(ticker):
 # MARKET DATA
 # =====================================================
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_market_data(ticker):
-    df = yf.download(
-        ticker, period="5y", interval="1d",
-        auto_adjust=True, progress=False
-    )
+    df = None
+    for _ in range(2):  # one retry, Yahoo sometimes rate-limits
+        try:
+            df = yf.download(
+                ticker, period="5y", interval="1d",
+                auto_adjust=True, progress=False, threads=False
+            )
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            break
 
     if df is None or df.empty:
-        raise ValueError(f"No market data available for {ticker}")
+        raise ValueError(
+            f"No market data available for {ticker}. "
+            "Yahoo Finance may be rate-limiting, try again in a minute."
+        )
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -282,6 +302,11 @@ def add_indicators(df):
     df["Stoch_K"] = 100 * (df["Close"] - low14) / (high14 - low14).replace(0, np.nan)
 
     return df
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_indicators(ticker):
+    return add_indicators(get_market_data(ticker))
 
 
 def technical_score(latest):
@@ -397,24 +422,58 @@ def predict_stock(ticker, data):
 # LIVE ML LAB (works for ANY asset class)
 # =====================================================
 
-MODEL_ZOO = {
-    "Ridge": lambda: make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
-    "Lasso": lambda: make_pipeline(
-        StandardScaler(), Lasso(alpha=1e-4, max_iter=10000)
+def strip_tz(obj):
+    obj = obj.copy()
+    idx = obj.index
+    if getattr(idx, "tz", None) is not None:
+        obj.index = idx.tz_localize(None)
+    return obj
+
+
+# name -> (factory, kind). kind: "reg" = next-day return, "clf" = P(up)
+MODEL_SPECS = {
+    "Ridge": (
+        lambda: make_pipeline(StandardScaler(), Ridge(alpha=10.0)), "reg"
     ),
-    "Random Forest": lambda: RandomForestRegressor(
-        n_estimators=150, max_depth=5, min_samples_leaf=20,
-        n_jobs=-1, random_state=42
+    "Lasso": (
+        lambda: make_pipeline(
+            StandardScaler(), Lasso(alpha=1e-4, max_iter=10000)
+        ), "reg"
     ),
-    "Gradient Boosting": lambda: GradientBoostingRegressor(
-        n_estimators=150, max_depth=3, learning_rate=0.05,
-        subsample=0.8, random_state=42
+    "Random Forest": (
+        lambda: RandomForestRegressor(
+            n_estimators=150, max_depth=5, min_samples_leaf=20,
+            n_jobs=-1, random_state=42
+        ), "reg"
+    ),
+    "Gradient Boosting": (
+        lambda: GradientBoostingRegressor(
+            n_estimators=150, max_depth=3, learning_rate=0.05,
+            subsample=0.8, random_state=42
+        ), "reg"
+    ),
+    "Logistic (Up/Down)": (
+        lambda: make_pipeline(
+            StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)
+        ), "clf"
+    ),
+    "RF Classifier": (
+        lambda: RandomForestClassifier(
+            n_estimators=200, max_depth=5, min_samples_leaf=20,
+            n_jobs=-1, random_state=42
+        ), "clf"
+    ),
+    "GB Classifier": (
+        lambda: GradientBoostingClassifier(
+            n_estimators=150, max_depth=2, learning_rate=0.05,
+            subsample=0.8, random_state=42
+        ), "clf"
     ),
 }
 
 
-def build_ml_dataset(ind):
-    """Features for next-day return prediction. Uses only past information."""
+def build_ml_dataset(ind, market=None):
+    """Features for next-day prediction. Uses only past information."""
     d = ind.copy()
     ret = d["Close"].pct_change()
 
@@ -431,21 +490,34 @@ def build_ml_dataset(ind):
 
     f["mom10"] = d["Close"].pct_change(10)
     f["mom20"] = d["Close"].pct_change(20)
+    f["mom60"] = d["Close"].pct_change(60)
     f["vol5"] = ret.rolling(5).std()
     f["vol20"] = ret.rolling(20).std()
+    f["vol_regime"] = f["vol5"] / f["vol20"].replace(0, np.nan)
     f["rsi"] = d["RSI"] / 100
+    f["rsi_chg3"] = (d["RSI"] / 100).diff(3)
     f["macd_hist"] = d["MACD_Hist"] / d["Close"]
     f["bb_pos"] = (d["Close"] - d["BB_Lower"]) / (
         d["BB_Upper"] - d["BB_Lower"]
     ).replace(0, np.nan)
     f["atr_pct"] = d["ATR"] / d["Close"]
     f["stoch"] = d["Stoch_K"] / 100
+    f["dist_high126"] = d["Close"] / d["Close"].rolling(126).max() - 1
+    f["dow"] = d.index.dayofweek / 4
 
     # Volume features only if the asset really has volume (forex does not)
     if d["Volume"].sum() > 0:
-        f["vol_ratio"] = np.log(
+        f["volume_ratio"] = np.log(
             (d["Volume"] + 1) / (d["Volume"].rolling(20).mean() + 1)
         )
+
+    # Market context (S&P 500): how the broad market behaved
+    if market is not None and len(market) > 100:
+        mc = market["Close"]
+        mret = mc.pct_change()
+        f["mkt_ret0"] = mret.reindex(d.index, method="ffill")
+        f["mkt_ret5"] = mc.pct_change(5).reindex(d.index, method="ffill")
+        f["mkt_vol20"] = mret.rolling(20).std().reindex(d.index, method="ffill")
 
     f = f.replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -457,59 +529,129 @@ def build_ml_dataset(ind):
 
 
 def feature_importance(model, cols):
+    if model is None:
+        return pd.Series(dtype=float)
     est = model.steps[-1][1] if hasattr(model, "steps") else model
     if hasattr(est, "feature_importances_"):
         vals = est.feature_importances_
     elif hasattr(est, "coef_"):
-        vals = np.abs(est.coef_)
+        vals = np.abs(np.ravel(est.coef_))
     else:
         return pd.Series(dtype=float)
-    s = pd.Series(vals, index=cols)
-    total = s.sum()
-    return (s / total if total > 0 else s).sort_values(ascending=False)
+    s_ = pd.Series(vals, index=cols)
+    total = s_.sum()
+    return (s_ / total if total > 0 else s_).sort_values(ascending=False)
+
+
+def fit_predict(name, Xtr, ytr, Xte):
+    """Returns (model, signal). Signal is a return for regressors and
+    P(up) - 0.5 for classifiers, so sign(signal) is always the direction."""
+    factory, kind = MODEL_SPECS[name]
+    model = factory()
+
+    if kind == "reg":
+        model.fit(Xtr, ytr)
+        return model, model.predict(Xte)
+
+    labels = (ytr > 0).astype(int)
+    if labels.nunique() < 2:
+        return None, np.zeros(len(Xte))
+    model.fit(Xtr, labels)
+    return model, model.predict_proba(Xte)[:, 1] - 0.5
+
+
+def score_predictions(y_true, signal):
+    y_true = pd.Series(y_true)
+    signal = pd.Series(np.asarray(signal), index=y_true.index)
+    dir_acc = float((np.sign(signal) == np.sign(y_true)).mean())
+    up_rate = float((y_true > 0).mean())
+    try:
+        auc = float(roc_auc_score(y_true > 0, signal))
+    except ValueError:
+        auc = np.nan
+    return dir_acc, max(up_rate, 1 - up_rate), auc
+
+
+def walk_forward(name, X, y, n_splits=5):
+    """Expanding-window validation: train on the past, test on the next block."""
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    parts, accs, edges = [], [], []
+    for tr, te in tscv.split(X):
+        _, sig = fit_predict(name, X.iloc[tr], y.iloc[tr], X.iloc[te])
+        sig = pd.Series(sig, index=X.index[te])
+        acc, base, _ = score_predictions(y.iloc[te], sig)
+        parts.append(sig)
+        accs.append(acc)
+        edges.append(acc - base)
+    return pd.concat(parts), accs, edges
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def run_ml_experiment(ticker, model_name, test_frac):
-    raw = get_market_data(ticker)
+    raw = strip_tz(get_market_data(ticker))
+    try:
+        market = strip_tz(get_market_data("^GSPC"))
+    except Exception:
+        market = None
+
     ind = add_indicators(raw)
-    X, y, latest_X = build_ml_dataset(ind)
+    X, y, latest_X = build_ml_dataset(ind, market)
 
     if len(X) < 300:
         raise ValueError("Not enough history to train a reliable model.")
 
+    kind = MODEL_SPECS[model_name][1]
+
+    # 1) Single holdout split (last test_frac of the history)
     split = int(len(X) * (1 - test_frac))
     Xtr, Xte = X.iloc[:split], X.iloc[split:]
     ytr, yte = y.iloc[:split], y.iloc[split:]
 
-    model = MODEL_ZOO[model_name]()
-    model.fit(Xtr, ytr)
-    pred = pd.Series(model.predict(Xte), index=Xte.index)
+    _, sig = fit_predict(model_name, Xtr, ytr, Xte)
+    pred = pd.Series(sig, index=Xte.index)
+    dir_acc, baseline, auc = score_predictions(yte, pred)
 
-    dir_acc = float((np.sign(pred) == np.sign(yte)).mean())
-    up_rate = float((yte > 0).mean())
+    if kind == "reg":
+        mae = float(mean_absolute_error(yte, pred))
+        rmse = float(np.sqrt(mean_squared_error(yte, pred)))
+        r2 = float(r2_score(yte, pred))
+    else:
+        mae = rmse = r2 = np.nan
 
-    # Re-fit on ALL data for the latest forecast
-    final = MODEL_ZOO[model_name]()
-    final.fit(X, y)
-    next_ret = float(final.predict(latest_X)[0])
+    # 2) Walk-forward validation (more trustworthy than one split)
+    oos, accs, edges = walk_forward(model_name, X, y)
+    y_wf = y.reindex(oos.index)
+
+    # 3) Final model on ALL data for the latest forecast
+    final, fsig = fit_predict(model_name, X, y, latest_X)
     current = float(raw["Close"].iloc[-1])
+
+    if kind == "reg":
+        next_ret = float(fsig[0])
+        p_up = np.nan
+        next_price = current * (1 + next_ret)
+    else:
+        next_ret = np.nan
+        p_up = float(fsig[0] + 0.5)
+        next_price = np.nan
 
     return {
         "model": model_name,
-        "mae": float(mean_absolute_error(yte, pred)),
-        "rmse": float(np.sqrt(mean_squared_error(yte, pred))),
-        "r2": float(r2_score(yte, pred)),
-        "dir_acc": dir_acc,
-        "baseline": max(up_rate, 1 - up_rate),
-        "y_test": yte,
-        "pred": pred,
+        "kind": kind,
+        "mae": mae, "rmse": rmse, "r2": r2,
+        "dir_acc": dir_acc, "baseline": baseline, "auc": auc,
+        "wf_acc": float(np.mean(accs)),
+        "wf_std": float(np.std(accs)),
+        "wf_edge": float(np.mean(edges)),
+        "wf_beat": int(sum(e > 0 for e in edges)),
+        "wf_folds": len(edges),
+        "y_test": yte, "pred": pred,
+        "y_wf": y_wf, "pred_wf": oos,
         "importance": feature_importance(final, X.columns),
         "current": current,
-        "next_ret": next_ret,
-        "next_price": current * (1 + next_ret),
-        "train_rows": len(Xtr),
-        "test_rows": len(Xte),
+        "next_ret": next_ret, "p_up": p_up, "next_price": next_price,
+        "train_rows": len(Xtr), "test_rows": len(Xte),
+        "n_features": X.shape[1],
     }
 
 
@@ -654,6 +796,7 @@ st.sidebar.markdown("---")
 st.sidebar.caption(f"Market: {asset_class}")
 st.sidebar.caption(f"Instrument: {selected_ticker}")
 st.sidebar.caption("Data source: Yahoo Finance")
+st.sidebar.caption("App version: v4 (15 Nov 2026)")
 
 if st.sidebar.button("🧹 Clear cached data"):
     st.cache_data.clear()
@@ -681,9 +824,9 @@ tab_pred, tab_tech, tab_ml, tab_risk, tab_port, tab_explore, tab_about = tabs
 with tab_pred:
     st.subheader("AI Stock Prediction Center")
     st.info(
-        "These predictions use your saved Ridge Regression stock models. "
-        "For forex, metals, indices or crypto, train a model live in the "
-        "🧪 ML Lab tab."
+        "Uses your saved Ridge Regression models when available. For stocks "
+        "without a saved model, a Ridge model is trained live automatically. "
+        "For forex, metals, indices or crypto use the 🧪 ML Lab tab."
     )
 
     stock_lookup = ASSETS["Stocks"]
@@ -694,23 +837,34 @@ with tab_pred:
         default=["Apple", "NVIDIA", "Microsoft"]
     )
 
-    if st.button("🚀 Generate AI Predictions", type="primary",
-                 key="prediction_button"):
+    def run_predictions(names):
         results, errors = [], []
 
         with st.spinner("Running AI models..."):
-            for stock_name in selected_prediction_names:
+            for stock_name in names:
                 ticker = stock_lookup[stock_name]
                 try:
                     data = get_market_data(ticker)
-                    current, predicted, ret = predict_stock(ticker, data)
 
-                    if ret > 0.002:
-                        view = "Bullish"
-                    elif ret < -0.002:
-                        view = "Bearish"
-                    else:
+                    try:
+                        current, predicted, ret = predict_stock(ticker, data)
+                        source = "Saved Ridge"
+                    except FileNotFoundError:
+                        live = run_ml_experiment(ticker, "Ridge", 0.2)
+                        current = live["current"]
+                        predicted = live["next_price"]
+                        ret = live["next_ret"]
+                        source = "Live Ridge (trained now)"
+
+                    vol = float(data["Close"].pct_change().tail(60).std())
+                    z = ret / vol if vol > 0 else 0.0
+
+                    if abs(z) < 0.05:
                         view = "Neutral"
+                    elif abs(z) < 0.15:
+                        view = "Slightly Bullish" if z > 0 else "Slightly Bearish"
+                    else:
+                        view = "Bullish" if z > 0 else "Bearish"
 
                     results.append({
                         "Stock": stock_name,
@@ -718,13 +872,22 @@ with tab_pred:
                         "Current Price": current,
                         "Predicted Price": predicted,
                         "Expected Return (%)": ret * 100,
-                        "View": view
+                        "Signal (σ)": z,
+                        "View": view,
+                        "Model Source": source,
+                        "Data As Of": data.index[-1].strftime("%Y-%m-%d")
                     })
                 except Exception as e:
                     errors.append(f"{stock_name}: {e}")
 
         st.session_state["ai_results"] = results
         st.session_state["ai_errors"] = errors
+
+    if st.button("🚀 Generate AI Predictions", type="primary",
+                 key="prediction_button"):
+        run_predictions(selected_prediction_names)
+    elif "ai_results" not in st.session_state and selected_prediction_names:
+        run_predictions(selected_prediction_names)
 
     if st.session_state.get("ai_results"):
         result_df = pd.DataFrame(st.session_state["ai_results"])
@@ -734,20 +897,32 @@ with tab_pred:
             result_df.style.format({
                 "Current Price": "{:,.4f}",
                 "Predicted Price": "{:,.4f}",
-                "Expected Return (%)": "{:+.2f}%"
+                "Expected Return (%)": "{:+.3f}%",
+                "Signal (σ)": "{:+.2f}"
             }),
+            hide_index=True,
             **WIDE
         )
 
-        fig = px.bar(
-            result_df, x="Stock", y="Expected Return (%)",
-            color="Expected Return (%)",
-            color_continuous_scale=["#FF5263", "#64748B", "#00D6A3"],
-            color_continuous_midpoint=0
-        )
+        fig = go.Figure(go.Bar(
+            x=result_df["Stock"],
+            y=result_df["Expected Return (%)"],
+            marker_color=np.where(
+                result_df["Expected Return (%)"] >= 0, "#00D6A3", "#FF5263"
+            ),
+            text=result_df["Expected Return (%)"].map(lambda v: f"{v:+.3f}%"),
+            textposition="outside",
+            textfont=dict(color="#F1F5F9")
+        ))
         plot_chart(
             style_fig(fig, 380, "Expected Next-Day Return (%)"),
             key="pred_bar", **WIDE
+        )
+
+        st.caption(
+            "Signal (σ) = predicted return divided by the stock's recent daily "
+            "volatility. Values near 0 mean the model sees no meaningful edge. "
+            "Next-day moves are very hard to predict, so treat this as one input only."
         )
 
         st.download_button(
@@ -773,7 +948,7 @@ with tab_tech:
 
     try:
         with st.spinner("Loading market data..."):
-            full = add_indicators(get_market_data(selected_ticker))
+            full = get_indicators(selected_ticker)
         data = full.tail(PERIOD_MAP[period])
         latest = data.iloc[-1]
 
@@ -784,6 +959,9 @@ with tab_tech:
         d.metric("ATR (14)", f"{latest['ATR']:.4f}")
 
         score, label, reasons = technical_score(latest)
+        gauge_color = (
+            "#00D6A3" if score > 0 else "#FF5263" if score < 0 else "#94A3B8"
+        )
 
         g1, g2 = st.columns([1, 1])
         with g1:
@@ -793,7 +971,7 @@ with tab_tech:
                 title={"text": f"Technical Score: {label}"},
                 gauge={
                     "axis": {"range": [-5, 5]},
-                    "bar": {"color": "#00D6A3"},
+                    "bar": {"color": gauge_color},
                     "steps": [
                         {"range": [-5, -2], "color": "#7F1D1D"},
                         {"range": [-2, 2], "color": "#334155"},
@@ -832,20 +1010,23 @@ with tab_tech:
 with tab_ml:
     st.subheader("🧪 ML Lab: Train, Compare & Backtest Models Live")
     st.caption(
-        "Trains models on the selected asset's own history (chronological "
-        "train/test split, no shuffling) to predict the next-day return."
+        "Regression models predict the next-day return. Classifiers predict "
+        "the probability that tomorrow closes up. Every model is checked on a "
+        "holdout period AND with walk-forward validation (5 expanding folds)."
     )
 
     names_list = list(ALL_INSTRUMENTS.keys())
     default_idx = names_list.index(selected_name) if selected_name in names_list else 0
 
-    c1, c2, c3 = st.columns([2, 3, 1])
+    c1, c2 = st.columns([3, 1])
     ml_name = c1.selectbox("Instrument", names_list, index=default_idx, key="ml_name")
-    ml_models = c2.multiselect(
-        "Models to compare", list(MODEL_ZOO.keys()),
-        default=["Ridge", "Random Forest"], key="ml_models"
+    test_pct = c2.slider("Holdout %", 10, 40, 20, 5, key="ml_test") / 100
+
+    ml_models = st.multiselect(
+        "Models to compare", list(MODEL_SPECS.keys()),
+        default=["Ridge", "Random Forest", "Logistic (Up/Down)"],
+        key="ml_models"
     )
-    test_pct = c3.slider("Test %", 10, 40, 20, 5, key="ml_test") / 100
 
     if st.button("🧠 Train & Evaluate", type="primary", key="ml_train"):
         if not ml_models:
@@ -853,7 +1034,7 @@ with tab_ml:
         else:
             ticker = ALL_INSTRUMENTS[ml_name]
             res, errs = {}, []
-            with st.spinner("Training models..."):
+            with st.spinner("Training models (holdout + walk-forward)..."):
                 for m in ml_models:
                     try:
                         res[m] = run_ml_experiment(ticker, m, test_pct)
@@ -874,40 +1055,57 @@ with tab_ml:
 
         table = pd.DataFrame([{
             "Model": m,
-            "MAE (%)": r["mae"] * 100,
-            "RMSE (%)": r["rmse"] * 100,
-            "R²": r["r2"],
-            "Direction Acc. (%)": r["dir_acc"] * 100,
+            "Type": "Classifier" if r["kind"] == "clf" else "Regression",
+            "Holdout Acc (%)": r["dir_acc"] * 100,
             "Baseline (%)": r["baseline"] * 100,
-            "Next-Day Forecast (%)": r["next_ret"] * 100,
-            "Forecast Price": r["next_price"],
+            "Edge (pp)": (r["dir_acc"] - r["baseline"]) * 100,
+            "Walk-Fwd Acc (%)": r["wf_acc"] * 100,
+            "WF Edge (pp)": r["wf_edge"] * 100,
+            "Folds > Baseline": f"{r['wf_beat']}/{r['wf_folds']}",
+            "AUC": r["auc"],
+            "R²": r["r2"],
+            "Next-Day Return (%)": r["next_ret"] * 100,
+            "P(Up) (%)": r["p_up"] * 100,
         } for m, r in results.items()])
 
         st.dataframe(
             table.style.format({
-                "MAE (%)": "{:.3f}", "RMSE (%)": "{:.3f}", "R²": "{:.4f}",
-                "Direction Acc. (%)": "{:.2f}", "Baseline (%)": "{:.2f}",
-                "Next-Day Forecast (%)": "{:+.3f}", "Forecast Price": "{:,.4f}"
-            }),
+                "Holdout Acc (%)": "{:.2f}", "Baseline (%)": "{:.2f}",
+                "Edge (pp)": "{:+.2f}", "Walk-Fwd Acc (%)": "{:.2f}",
+                "WF Edge (pp)": "{:+.2f}", "AUC": "{:.3f}", "R²": "{:.4f}",
+                "Next-Day Return (%)": "{:+.3f}", "P(Up) (%)": "{:.1f}"
+            }, na_rep="-"),
+            hide_index=True,
             **WIDE
         )
 
         fig = go.Figure()
-        fig.add_bar(x=table["Model"], y=table["Direction Acc. (%)"],
-                    name="Model", marker_color="#00D6A3")
+        fig.add_bar(x=table["Model"], y=table["Holdout Acc (%)"],
+                    name="Holdout", marker_color="#00D6A3")
+        fig.add_bar(x=table["Model"], y=table["Walk-Fwd Acc (%)"],
+                    name="Walk-forward", marker_color="#3B82F6")
         fig.add_bar(x=table["Model"], y=table["Baseline (%)"],
                     name="Always-majority baseline", marker_color="#64748B")
-        fig.update_layout(barmode="group", yaxis_range=[40, 65])
+        fig.update_layout(barmode="group", yaxis_range=[35, 70])
         plot_chart(
-            style_fig(fig, 340, "Directional Accuracy vs Baseline"),
+            style_fig(fig, 360, "Directional Accuracy vs Baseline"),
             key="ml_dir_bar", **WIDE
         )
 
-        st.info(
-            "Reality check: daily returns are very noisy. R² near 0 and "
-            "direction accuracy close to the baseline is normal. A model "
-            "that beats the baseline consistently is the real goal."
-        )
+        best = table.sort_values("WF Edge (pp)", ascending=False).iloc[0]
+        if best["WF Edge (pp)"] > 0.5:
+            auc_txt = f"{best['AUC']:.3f}" if pd.notna(best["AUC"]) else "n/a"
+            st.success(
+                f"Best by walk-forward: **{best['Model']}**, "
+                f"{best['WF Edge (pp)']:+.2f} pp over baseline "
+                f"(beat baseline in {best['Folds > Baseline']} folds, AUC {auc_txt})."
+            )
+        else:
+            st.warning(
+                "No model beats the always-majority baseline consistently on "
+                "this asset. For daily data this is a normal, honest result. "
+                "Try another asset or a different model type."
+            )
 
         st.markdown("### 🔍 Inspect one model")
         chosen = st.selectbox("Model", list(results.keys()), key="ml_inspect")
@@ -915,9 +1113,17 @@ with tab_ml:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Current Price", f"{r['current']:,.4f}")
-        m2.metric("Forecast Price", f"{r['next_price']:,.4f}",
-                  delta=f"{r['next_ret']*100:+.2f}%")
+        if r["kind"] == "reg":
+            m2.metric("Forecast Price", f"{r['next_price']:,.4f}",
+                      delta=f"{r['next_ret']*100:+.2f}%")
+        else:
+            m2.metric("P(Up) tomorrow", f"{r['p_up']*100:.1f}%",
+                      delta=f"{(r['p_up']-0.5)*100:+.1f} pp vs 50%")
         m3.metric("Train / Test rows", f"{r['train_rows']} / {r['test_rows']}")
+        st.caption(
+            f"{r['n_features']} features | walk-forward accuracy "
+            f"{r['wf_acc']*100:.1f}% ± {r['wf_std']*100:.1f}% across folds"
+        )
 
         i1, i2 = st.columns(2)
         with i1:
@@ -930,32 +1136,69 @@ with tab_ml:
                     key="ml_imp", **WIDE
                 )
         with i2:
-            tail = 120
-            fig = go.Figure()
-            fig.add_scatter(x=r["y_test"].index[-tail:],
-                            y=r["y_test"].iloc[-tail:] * 100,
-                            name="Actual", line=dict(color="#E2E8F0", width=1))
-            fig.add_scatter(x=r["pred"].index[-tail:],
-                            y=r["pred"].iloc[-tail:] * 100,
-                            name="Predicted", line=dict(color="#F5B942", width=2))
-            plot_chart(
-                style_fig(fig, 380, "Actual vs Predicted Return (%), last 120 test days"),
-                key="ml_avp", **WIDE
-            )
+            if r["kind"] == "reg":
+                tail = 120
+                fig = go.Figure()
+                fig.add_scatter(x=r["y_test"].index[-tail:],
+                                y=r["y_test"].iloc[-tail:] * 100,
+                                name="Actual", line=dict(color="#E2E8F0", width=1))
+                fig.add_scatter(x=r["pred"].index[-tail:],
+                                y=r["pred"].iloc[-tail:] * 100,
+                                name="Predicted", line=dict(color="#F5B942", width=2))
+                plot_chart(
+                    style_fig(fig, 380, "Actual vs Predicted Return (%), last 120 test days"),
+                    key="ml_avp", **WIDE
+                )
+            else:
+                try:
+                    cal = pd.DataFrame({
+                        "p": r["pred"] + 0.5,
+                        "up": (r["y_test"] > 0).astype(float)
+                    })
+                    cal["bucket"] = pd.qcut(cal["p"], 5, labels=False,
+                                            duplicates="drop")
+                    g = cal.groupby("bucket")["up"].mean() * 100
+                    fig = go.Figure(go.Bar(
+                        x=[f"Q{int(i)+1}" for i in g.index], y=g.values,
+                        marker_color="#00D6A3",
+                        text=[f"{v:.0f}%" for v in g.values],
+                        textposition="outside"
+                    ))
+                    fig.add_hline(y=50, line_dash="dash", line_color="#F5B942")
+                    fig.update_layout(yaxis_range=[0, 100])
+                    plot_chart(
+                        style_fig(fig, 380, "Actual up-days by predicted P(Up) bucket (Q5 = most bullish)"),
+                        key="ml_cal", **WIDE
+                    )
+                except Exception:
+                    st.caption("Not enough variation in predictions for a calibration chart.")
 
-        st.markdown("### 📉 Strategy Backtest (test period only)")
+        st.markdown("### 📉 Strategy Backtest")
+        src = st.radio(
+            "Backtest data",
+            ["Holdout test period", "Walk-forward (all out-of-sample)"],
+            horizontal=True, key="bt_src"
+        )
+        if src.startswith("Holdout"):
+            y_s, p_s = r["y_test"], r["pred"]
+        else:
+            y_s, p_s = r["y_wf"], r["pred_wf"]
+
         b1, b2, b3 = st.columns(3)
-        thr = b1.slider("Signal threshold (%)", 0.0, 1.0, 0.05, 0.05,
-                        key="bt_thr") / 100
+        if r["kind"] == "reg":
+            thr = b1.slider("Signal threshold (%)", 0.0, 1.0, 0.05, 0.05,
+                            key="bt_thr") / 100
+        else:
+            thr = b1.slider("Min. probability edge (pp above 50%)", 0.0, 10.0,
+                            2.0, 0.5, key="bt_thr_clf") / 100
         short = b2.checkbox("Allow short selling", value=False, key="bt_short")
         cost = b3.slider("Cost per trade (bps)", 0, 30, 5, key="bt_cost")
 
-        strat, pos, n_trades = backtest(r["y_test"], r["pred"], thr, short, cost)
-        bh = r["y_test"]
+        strat, pos, n_trades = backtest(y_s, p_s, thr, short, cost)
 
         eq = pd.DataFrame({
             "ML Strategy": (1 + strat).cumprod(),
-            "Buy & Hold": (1 + bh).cumprod()
+            "Buy & Hold": (1 + y_s).cumprod()
         })
         fig = px.line(eq, color_discrete_sequence=["#00D6A3", "#64748B"])
         plot_chart(
@@ -964,12 +1207,13 @@ with tab_ml:
         )
 
         s_stats = perf_stats(strat, rf_rate)
-        b_stats = perf_stats(bh, rf_rate)
+        b_stats = perf_stats(y_s, rf_rate)
+
         def _fmt(stats):
-            out = {}
+            out_ = {}
             for key, val in stats.items():
-                out[key] = f"{val:.2f}" if key == "Sharpe" else f"{val*100:.2f}%"
-            return out
+                out_[key] = f"{val:.2f}" if key == "Sharpe" else f"{val*100:.2f}%"
+            return out_
 
         cmp_df = pd.DataFrame(
             {"ML Strategy": _fmt(s_stats), "Buy & Hold": _fmt(b_stats)}
@@ -1010,12 +1254,12 @@ with tab_risk:
         k3.metric("Max Drawdown", f"{dd.min()*100:.2f}%")
         k4.metric("Skew / Kurtosis", f"{rets.skew():.2f} / {rets.kurt():.2f}")
 
-        k5, k6, k7, k8 = st.columns(4)
-        k5.metric("VaR 95% (1 day)", f"{var95*100:.2f}%")
-        k6.metric("VaR 99% (1 day)", f"{var99*100:.2f}%")
+        k5, k6, k7, k8, k9 = st.columns(5)
+        k5.metric("VaR 95% (1d)", f"{var95*100:.2f}%")
+        k6.metric("VaR 99% (1d)", f"{var99*100:.2f}%")
         k7.metric("CVaR 95%", f"{cvar95*100:.2f}%")
-        k8.metric("Best / Worst Day",
-                  f"{rets.max()*100:+.1f}% / {rets.min()*100:+.1f}%")
+        k8.metric("Best Day", f"{rets.max()*100:+.1f}%")
+        k9.metric("Worst Day", f"{rets.min()*100:+.1f}%")
 
         r1, r2 = st.columns(2)
         with r1:
@@ -1226,8 +1470,10 @@ with tab_port:
             default=["Apple", "Gold", "S&P 500", "Bitcoin"],
             key="opt_sel"
         )
-        n_port = st.slider("Random portfolios", 1000, 20000, 5000, 1000,
-                           key="opt_n")
+        n_port = st.slider("Random portfolios (for the cloud)", 1000, 20000,
+                           5000, 1000, key="opt_n")
+        max_w = st.slider("Max weight per asset (%)", 20, 100, 60, 5,
+                          key="opt_maxw") / 100
 
         if st.button("🎯 Optimize Portfolio", type="primary", key="opt_btn"):
             if len(opt_sel) < 3:
@@ -1236,7 +1482,9 @@ with tab_port:
                 try:
                     closes = {}
                     for n in opt_sel:
-                        closes[n] = get_market_data(ALL_INSTRUMENTS[n])["Close"]
+                        closes[n] = strip_tz(
+                            get_market_data(ALL_INSTRUMENTS[n])
+                        )["Close"]
                     prices = pd.concat(closes, axis=1).ffill(limit=3).dropna()
                     rets = prices.pct_change().dropna().tail(756)
 
@@ -1246,61 +1494,105 @@ with tab_port:
                     mu = rets.mean().values * 252
                     cov = rets.cov().values * 252
                     k = len(opt_sel)
+                    cap = max(max_w, 1.0 / k + 1e-6)
 
+                    # Random cloud (for the picture)
                     rng = np.random.default_rng(7)
                     W = rng.dirichlet(np.ones(k), size=n_port)
                     p_ret = W @ mu
                     p_vol = np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W))
                     p_sh = (p_ret - rf_rate) / p_vol
 
-                    i_max, i_min = p_sh.argmax(), p_vol.argmin()
+                    # Exact optimisation (SLSQP)
+                    def port_vol(w):
+                        return float(np.sqrt(w @ cov @ w))
+
+                    def neg_sharpe(w):
+                        v = port_vol(w)
+                        return -((w @ mu - rf_rate) / v) if v > 0 else 0.0
+
+                    cons = ({"type": "eq", "fun": lambda w: np.sum(w) - 1},)
+                    bnds = [(0.0, cap)] * k
+                    w0 = np.ones(k) / k
+
+                    r_sh = minimize(neg_sharpe, w0, method="SLSQP",
+                                    bounds=bnds, constraints=cons)
+                    r_mv = minimize(port_vol, w0, method="SLSQP",
+                                    bounds=bnds, constraints=cons)
+
+                    def clean(w):
+                        w = np.clip(w, 0, None)
+                        return w / w.sum()
+
+                    w_sh = clean(r_sh.x) if r_sh.success else W[p_sh.argmax()]
+                    w_mv = clean(r_mv.x) if r_mv.success else W[p_vol.argmin()]
+
+                    def stats(w):
+                        v = port_vol(w)
+                        return float(w @ mu), v, (float(w @ mu) - rf_rate) / v
+
+                    ret_sh, vol_sh, sh_sh = stats(w_sh)
+                    ret_mv, vol_mv, sh_mv = stats(w_mv)
 
                     fig = go.Figure()
                     fig.add_scatter(
                         x=p_vol * 100, y=p_ret * 100, mode="markers",
                         marker=dict(color=p_sh, colorscale="Viridis", size=4,
-                                    colorbar=dict(title="Sharpe")),
-                        name="Portfolios"
+                                    colorbar=dict(title="Sharpe", x=1.02)),
+                        name="Random portfolios"
                     )
                     fig.add_scatter(
-                        x=[p_vol[i_max] * 100], y=[p_ret[i_max] * 100],
-                        mode="markers", name="Max Sharpe",
-                        marker=dict(color="#F5B942", size=15, symbol="star")
+                        x=[vol_sh * 100], y=[ret_sh * 100], mode="markers",
+                        name="Max Sharpe",
+                        marker=dict(color="#F5B942", size=20, symbol="star",
+                                    line=dict(color="#FFFFFF", width=1.5))
                     )
                     fig.add_scatter(
-                        x=[p_vol[i_min] * 100], y=[p_ret[i_min] * 100],
-                        mode="markers", name="Min Volatility",
-                        marker=dict(color="#FF5263", size=13, symbol="diamond")
+                        x=[vol_mv * 100], y=[ret_mv * 100], mode="markers",
+                        name="Min Volatility",
+                        marker=dict(color="#FF5263", size=16, symbol="diamond",
+                                    line=dict(color="#FFFFFF", width=1.5))
                     )
                     fig.update_layout(
-                        xaxis_title="Volatility (%)", yaxis_title="Return (%)"
+                        xaxis_title="Volatility (%)", yaxis_title="Return (%)",
+                        legend=dict(orientation="h", yanchor="top", y=-0.18,
+                                    xanchor="left", x=0)
                     )
                     plot_chart(
-                        style_fig(fig, 460, "Efficient Frontier (random sampling)"),
+                        style_fig(fig, 500, "Efficient Frontier"),
                         key="opt_frontier", **WIDE
                     )
 
                     w_df = pd.DataFrame({
                         "Instrument": opt_sel,
-                        "Max Sharpe (%)": W[i_max] * 100,
-                        "Min Volatility (%)": W[i_min] * 100
+                        "Max Sharpe (%)": w_sh * 100,
+                        "Min Volatility (%)": w_mv * 100
                     })
                     st.dataframe(
                         w_df.style.format({
                             "Max Sharpe (%)": "{:.1f}",
                             "Min Volatility (%)": "{:.1f}"
                         }),
+                        hide_index=True,
                         **WIDE
                     )
 
-                    a, b = st.columns(2)
-                    a.metric("Max Sharpe: Return / Vol / Sharpe",
-                             f"{p_ret[i_max]*100:.1f}% / {p_vol[i_max]*100:.1f}% / {p_sh[i_max]:.2f}")
-                    b.metric("Min Vol: Return / Vol / Sharpe",
-                             f"{p_ret[i_min]*100:.1f}% / {p_vol[i_min]*100:.1f}% / {p_sh[i_min]:.2f}")
+                    st.markdown("**Max Sharpe portfolio**")
+                    a1, a2, a3 = st.columns(3)
+                    a1.metric("Return", f"{ret_sh*100:.1f}%")
+                    a2.metric("Volatility", f"{vol_sh*100:.1f}%")
+                    a3.metric("Sharpe", f"{sh_sh:.2f}")
+
+                    st.markdown("**Min Volatility portfolio**")
+                    b1_, b2_, b3_ = st.columns(3)
+                    b1_.metric("Return", f"{ret_mv*100:.1f}%")
+                    b2_.metric("Volatility", f"{vol_mv*100:.1f}%")
+                    b3_.metric("Sharpe", f"{sh_mv:.2f}")
+
                     st.caption(
-                        "Based on historical returns (up to 3 years of overlapping "
-                        "days). Historical optimal weights often do not hold in future."
+                        "Weights come from a real optimiser (SLSQP) with your max-weight "
+                        "limit; the dots are random portfolios for context. Based on up to "
+                        "3 years of overlapping history, so future results can differ."
                     )
                 except Exception as e:
                     st.error(str(e))
@@ -1315,8 +1607,10 @@ with tab_port:
         )
         if len(corr_sel) >= 2:
             try:
-                closes = {n: get_market_data(ALL_INSTRUMENTS[n])["Close"]
-                          for n in corr_sel}
+                closes = {
+                    n: strip_tz(get_market_data(ALL_INSTRUMENTS[n]))["Close"]
+                    for n in corr_sel
+                }
                 prices = pd.concat(closes, axis=1).ffill(limit=3).dropna()
                 corr = prices.pct_change().dropna().tail(252).corr()
                 fig = px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1,
@@ -1381,15 +1675,20 @@ with tab_explore:
                             (last - lo52) / (hi52 - lo52) * 100 if hi52 > lo52 else np.nan,
                         "RSI": rsi
                     })
-                    closes[name] = cl.tail(252)
+                    closes[name] = strip_tz(cl).tail(252)
                 except Exception as e:
                     market_errors.append(f"{name}: {e}")
 
         st.session_state["market_results"] = market_results
         st.session_state["market_errors"] = market_errors
         st.session_state["market_closes"] = closes
+        st.session_state["market_class"] = explorer_class
 
-    if st.session_state.get("market_results"):
+    same_class = st.session_state.get("market_class") == explorer_class
+    if not same_class:
+        st.caption("Press **Load Market Data** to see this asset class.")
+
+    if same_class and st.session_state.get("market_results"):
         market_df = pd.DataFrame(st.session_state["market_results"])
 
         st.dataframe(
@@ -1417,7 +1716,7 @@ with tab_explore:
                            market_df.to_csv(index=False),
                            file_name="market_explorer.csv", mime="text/csv")
 
-    for error in st.session_state.get("market_errors", []):
+    for error in (st.session_state.get("market_errors", []) if same_class else []):
         st.warning(error)
 
 # =====================================================
@@ -1439,8 +1738,9 @@ with tab_about:
 
     **Machine Learning**
     - Saved Ridge Regression stock models (next-day return)
-    - ML Lab: live training for any asset (Ridge, Lasso, Random Forest, Gradient Boosting)
-    - Chronological train/test split, MAE, RMSE, R², directional accuracy
+    - ML Lab: live training for any asset, 4 regression + 3 up/down classifier models
+    - Holdout split AND walk-forward validation, AUC, directional accuracy vs baseline
+    - Features include momentum, volatility regime, RSI/MACD, S&P 500 market context
     - Feature importance and ML strategy backtesting with trading costs
 
     **Risk & Portfolio**
